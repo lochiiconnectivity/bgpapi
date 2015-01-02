@@ -1,6 +1,6 @@
 # BGP API
 
-`bgpapi` runs as a "parsed-route-backend" to [ExaBGP](http://code.google.com/p/exabgp/)
+`bgpapi` runs as a JSON "parsed-route-backend" to [ExaBGP](http://code.google.com/p/exabgp/)
 and provides an HTTP API to some BGP data.
 
 ## Compilation
@@ -17,6 +17,7 @@ bgpapi itself doesn't currently take any configuration. Configure a
 `neighbor` in ExaBGP and a `parsed-route-backend` process, like:
 
         process parsed-route-backend {
+		encoder json;
                 parse-routes;
                 peer-updates;
                 run /Users/ask/go/bin/bgpapi;
