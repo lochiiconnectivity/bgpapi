@@ -2,16 +2,16 @@ package main
 
 import (
 	"bufio"
-	"fmt"
+	"encoding/json"
 	"github.com/miekg/bitradix"
 	"io"
 	"log"
 	"net"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 )
+
 
 var neighbors Neighbors
 var neighbors_lock sync.RWMutex
@@ -45,188 +45,143 @@ func bgpReader() {
 	}
 }
 
-func processLine(line string) {
-	f := strings.SplitN(line, " ", 4)
-
-	if len(f) < 3 {
-		log.Printf("Did not split line into enough parts\nLINE: [%s]\nF: %#v\n", line, f)
-		return
-	}
-
-	neighbor_ip := f[1]
-	command := f[2]
+func getNeighbor (neighborIp string) *Neighbor {
 
 	neighbors_lock.RLock()
 	defer neighbors_lock.RUnlock()
 
-	if neighbors[neighbor_ip] == nil {
+	if neighbors[neighborIp] == nil {
 		neighbors_lock.RUnlock()
 		neighbors_lock.Lock()
 
 		neighbor := new(Neighbor)
+		neighbor.Ip = neighborIp
 		neighbor.trie = bitradix.New32()
-		neighbors[neighbor_ip] = neighbor
+
+		neighbors[neighborIp] = neighbor
 
 		neighbors_lock.Unlock()
 		neighbors_lock.RLock()
 		defer neighbors_lock.RUnlock() // double?
 	}
 
-	neighbor := neighbors[neighbor_ip]
+	neighbor := neighbors[neighborIp]
 
 	neighbor.lock.Lock()
 	defer neighbor.lock.Unlock()
 
-	switch command {
-	case "up", "connected", "down":
-		neighbor.State = command
-		log.Println("State change", line)
-		return
-	case "update":
-		neighbor.State = "update " + f[3]
-		return
-	case "announced":
-		// fmt.Printf("R: %#v\n", r)
-
-		neighbor.Updates++
-
-		route := parseRoute(f[3])
-
-		if ones, _ := route.Prefix.Mask.Size(); ones < 8 || ones > 25 {
-			// fmt.Println("prefix mask too big or small", route.Prefix)
-		} else {
-			if neighbor.AsnPrefix == nil {
-				neighbor.AsnPrefix = make(map[ASN]Prefixes)
-			}
-			if neighbor.PrefixAsn == nil {
-				neighbor.PrefixAsn = make(Prefixes)
-			}
-
-			if neighbor.AsnPrefix[route.PrimaryASN] == nil {
-				neighbor.AsnPrefix[route.PrimaryASN] = make(Prefixes)
-			}
-
-			neighbor.AsnPrefix[route.PrimaryASN][route.Prefix.String()] = 0
-			neighbor.PrefixAsn[route.Prefix.String()] = route.PrimaryASN
-
-			addRoute(neighbor.trie, route.Prefix, route)
-		}
-	case "withdrawn":
-
-		neighbor.Updates++
-
-		route := parseRoute(f[3])
-
-		removeRoute(neighbor.trie, route.Prefix)
-
-		if asn, exists := neighbor.PrefixAsn[route.Prefix.String()]; exists {
-			// fmt.Println("Removing ASN from prefix", asn, route.Prefix)
-			delete(neighbor.PrefixAsn, route.Prefix.String())
-			delete(neighbor.AsnPrefix[asn], route.Prefix.String())
-		} else {
-			log.Println("Could not find prefix in PrefixAsn")
-			log.Println("%#v", neighbor.PrefixAsn)
-		}
-	default:
-		err_text := fmt.Sprintf("Command not implemented: %s\n%s\n", command, line)
-		log.Println(err_text)
-		err := fmt.Errorf(err_text)
-		panic(err)
-	}
-
-	if neighbor.Updates%25000 == 0 {
-		log.Printf("Processed %v updates from %s\n", neighbor.Updates, neighbor_ip)
-	}
-
+	return neighbor
 }
 
-func parseRoute(input string) *Route {
+// Processes a line (JSON blob) from ExaBGP
+func processLine(line string) {
 
-	r := strings.Split(input, " ")
+	var exaMsg ExaMsg
+        exaAttrs := ExaAttrs{ASPath: make(ASPath, 0)}
 
-	route := new(Route)
-	route.Options = make(map[string]string)
-	aspath := make(ASPath, 0)
+	if err := json.Unmarshal([]byte(line), &exaMsg); err == nil {
 
-	var key string
+		neighbor := getNeighbor(exaMsg.Neighbor.Ip)
 
-	state := parseKey
+		if exaMsg.Type == "state"  {
+			neighbor.State = exaMsg.Neighbor.State
+			log.Printf("Neighbor %s State change to %s\n", exaMsg.Neighbor.Ip, exaMsg.Neighbor.State)
+		} else if exaMsg.Type == "update" {
 
-	for _, v := range r {
-		// fmt.Printf("k: %s, v: %s, state: %#v\n", key, v, state)
-
-		switch state {
-		case parseKey:
-			{
-				state = parseValue
-				key = v
-				continue
+			// Extract Important stuff(tm) from update, if is some (e.g AS Path)
+			if attribute, ok := exaMsg.Neighbor.Message.Update["attribute"]; ok {
+			   extractUpdateAttrSection(&exaAttrs, attribute.(map[string]interface{}))
 			}
-		case parseValue:
-			if v == "[" {
-				state = parseList
-				continue
+			
+			// Process announced prefixes, store them with their important stuff(tm)
+			if announce, ok := exaMsg.Neighbor.Message.Update["announce"]; ok {
+			   processUpdatePrefixSection(neighbor, &exaAttrs, "announce", announce.(map[string]interface{}))
 			}
-			state = parseKey
-
-			if key == "as-path" {
-				addASPath(&aspath, v)
-			}
-			route.Options[key] = v
-			continue
-		case parseList:
-			{
-				if v == "]" {
-					state = parseKey
-					continue
-				}
-				if key != "as-path" {
-					log.Println("can only do list for as-path")
-					log.Printf("key: %s, v: %s\n\n", key, v)
-					log.Println("LINE", input)
-					state = parseSkip
-					continue
-				}
-				if v == "(" {
-					state = parseSkip
-					continue
-				}
-
-				addASPath(&aspath, v)
-
-			}
-		case parseSkip:
-			switch v {
-			case ")":
-				state = parseList
-			case "]":
-				state = parseKey
+			
+			// Process withdrawn prefixes
+			if withdraw, ok := exaMsg.Neighbor.Message.Update["withdraw"]; ok {
+			   processUpdatePrefixSection(neighbor, &exaAttrs, "withdraw", withdraw.(map[string]interface{}))
 			}
 		}
 	}
-	// fmt.Printf("%#v / %#v\n", route, aspath)
-
-	_, prefix, err := net.ParseCIDR(route.Options["route"])
-	if err != nil {
-		log.Printf("Could not parse prefix %s %e\n", route.Options["route"], err)
-		panic("bad prefix")
-	}
-	route.Prefix = prefix
-	// fmt.Printf("IP: %s, PREFIX: %s\n", ip, prefix)
-
-	if len(aspath) > 0 {
-		route.PrimaryASN = ASN(aspath[len(aspath)-1])
-		route.ASPath = aspath
-	}
-
-	return route
 }
 
-func addASPath(aspath *ASPath, v string) {
-	asn, err := strconv.Atoi(v)
-	if err != nil {
-		log.Println("Could not parse number", v)
-		panic("Bad as-path")
+// Extract attributes
+func extractUpdateAttrSection(exaAttrs *ExaAttrs, attributeSectionData map[string]interface{}) {
+	if asPathRaw, ok:= attributeSectionData["as-path"]; ok {
+		asPathRawArray := asPathRaw.([]interface{})
+		for key := range asPathRawArray  {
+			if asn, ok := asPathRawArray[key].(float64); ok {
+				exaAttrs.ASPath = append(exaAttrs.ASPath, ASN(asn))
+			}
+		}
 	}
-	*aspath = append(*aspath, ASN(asn))
+}
+
+// Process an update
+func processUpdatePrefixSection(neighbor *Neighbor, exaAttrs *ExaAttrs, updatePrefixSection string, updatePrefixSectionData map[string]interface{}) {
+	if (updatePrefixSection == "announce") || (updatePrefixSection == "withdraw") {
+		for afi := range updatePrefixSectionData {
+		    processUpdatePrefixAFISection(neighbor, exaAttrs, updatePrefixSection, afi, updatePrefixSectionData[afi].(map[string]interface{}))
+		}
+	}
+}
+
+// Process an update for an AFI
+func processUpdatePrefixAFISection (neighbor *Neighbor, exaAttrs *ExaAttrs, updatePrefixSection string, afi string, updatePrefixAFISectionData map[string]interface{}) {
+	for nexthop := range updatePrefixAFISectionData {
+		for prefix := range updatePrefixAFISectionData[nexthop].(map[string]interface{}) {
+
+			neighbor.Updates++
+
+			_, parsedPrefix, err := net.ParseCIDR(prefix)
+			if err != nil {
+				log.Printf("Could not parse prefix %s %e\n", prefix, err)
+				panic("bad prefix")
+			}
+
+			route := new(Route)
+			route.Prefix = parsedPrefix
+
+			if (updatePrefixSection == "announce") { 
+				if len(exaAttrs.ASPath) > 0 {
+					route.PrimaryASN = ASN(exaAttrs.ASPath[len(exaAttrs.ASPath)-1])
+					route.ASPath = exaAttrs.ASPath
+				}
+	
+				if neighbor.AsnPrefix == nil {
+					neighbor.AsnPrefix = make(map[ASN]Prefixes)
+				}
+	
+				if neighbor.PrefixAsn == nil {
+					neighbor.PrefixAsn = make(Prefixes)
+				}
+	
+				if neighbor.AsnPrefix[route.PrimaryASN] == nil {
+					neighbor.AsnPrefix[route.PrimaryASN] = make(Prefixes)
+				}
+	
+				neighbor.AsnPrefix[route.PrimaryASN][route.Prefix.String()] = 0
+				neighbor.PrefixAsn[route.Prefix.String()] = route.PrimaryASN
+
+				addRoute(neighbor.trie, route.Prefix, route)
+
+			} else if (updatePrefixSection == "withdraw") {
+
+				removeRoute(neighbor.trie, route.Prefix)
+			
+				if asn, exists := neighbor.PrefixAsn[route.Prefix.String()]; exists {
+					delete(neighbor.PrefixAsn, route.Prefix.String())
+					delete(neighbor.AsnPrefix[asn], route.Prefix.String())
+				} else {
+					log.Println("Could not find prefix in PrefixAsn")
+					log.Println("%#v", neighbor.PrefixAsn)
+				}
+			}
+
+			if neighbor.Updates%25000 == 0 {
+				log.Printf("Processed %v updates from %s\n", neighbor.Updates, neighbor.Ip)
+			}
+		}
+  	}
 }

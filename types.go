@@ -6,6 +6,7 @@ import (
 	"sync"
 )
 
+
 type ASN uint32
 
 type ASPath []ASN
@@ -15,6 +16,7 @@ type Prefixes map[string]ASN
 type Neighbor struct {
 	lock      sync.RWMutex
 	State     string
+	Ip	  string
 	AsnPrefix map[ASN]Prefixes
 	PrefixAsn Prefixes
 	Updates   int
@@ -29,6 +31,34 @@ type Route struct {
 }
 
 type Neighbors map[string]*Neighbor
+
+type ExaMsg struct {
+        Exabgp   string
+        Host     string
+        Pid      string
+        Ppid     string
+        Time     float64
+        Type     string
+        Neighbor struct {
+                Ip      string
+                State    string
+                Address struct {
+                        Local string
+                        Peer  string
+                }
+                Asn struct {
+                        Local string
+                        Peer  string
+                }
+                Message struct {
+                        Update map[string]interface{}
+                }
+        }
+}
+
+type ExaAttrs struct {
+        ASPath  ASPath
+}
 
 const (
 	parseKey = iota

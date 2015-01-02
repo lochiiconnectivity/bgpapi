@@ -85,7 +85,7 @@ func ApiHandler(w http.ResponseWriter, r *http.Request) {
 			defer data.lock.RUnlock()
 
 			node := data.FindNode(&ip)
-			if node.Bits() > 0 {
+			if node != nil && node.Bits() > 0 {
 				result[neighbor] = new(ipasnResult)
 				route := node.Value.(*Route)
 				r := result[neighbor]
