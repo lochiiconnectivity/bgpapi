@@ -9,6 +9,7 @@ import (
 
 func addRoute(r *bitradix.Radix32, ipnet *net.IPNet, route *Route) {
 	net, mask := ipNetToUint(ipnet)
+	log.Println("Calling addroute net=%s, mask=%s, route=%s", net, mask, route)
 	r.Insert(net, mask, route)
 }
 
